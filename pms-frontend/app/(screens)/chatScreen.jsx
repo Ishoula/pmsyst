@@ -15,7 +15,8 @@ import {
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Colors } from '../../constants/colors';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { authFetch } from '../../context/AuthContext';
+import { authFetch, useAuth } from '../../context/AuthContext';
+import { io } from 'socket.io-client';
 
 import community from '../../assets/images/racoo.jpeg';
 
@@ -25,10 +26,15 @@ const ChatScreen = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
+  const [connected, setConnected] = useState(false);
   const flatListRef = useRef(null);
+  const socketRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+  const typingRef = useRef(false);
 
   const router = useRouter();
   const { name, chatId, me } = useLocalSearchParams();
+  const { token, apiBaseUrl } = useAuth();
 
   const myId = useMemo(() => (typeof me === 'string' ? me : null), [me]);
 
@@ -48,6 +54,13 @@ const ChatScreen = () => {
 
   const markRead = React.useCallback(async () => {
     if (!chatId || typeof chatId !== 'string') return;
+
+    const socket = socketRef.current;
+    if (socket && socket.connected) {
+      socket.emit('message:read', { chatId });
+      return;
+    }
+
     try {
       await authFetch(`/chats/${chatId}/read`, { method: 'PUT' });
     } catch {
@@ -63,6 +76,64 @@ const ChatScreen = () => {
     markRead();
   }, [markRead]);
 
+  useEffect(() => {
+    if (!chatId || typeof chatId !== 'string') return;
+    if (!token) return;
+
+    const baseUrl = apiBaseUrl;
+    const socket = io(baseUrl, {
+      transports: ['websocket'],
+      auth: { token: `Bearer ${token}` },
+      autoConnect: true,
+    });
+
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      setConnected(true);
+      socket.emit('join:chats', [chatId]);
+      socket.emit('message:read', { chatId });
+    });
+
+    socket.on('disconnect', () => {
+      setConnected(false);
+    });
+
+    socket.on('connect_error', (err) => {
+      setConnected(false);
+      setError(err?.message || 'Socket connection failed');
+    });
+
+    socket.on('message:new', (msg) => {
+      const incomingChatId = msg?.chat?._id || msg?.chat;
+      if (!incomingChatId || incomingChatId !== chatId) return;
+
+      setMessages((prev) => {
+        const id = msg?._id;
+        if (id && prev.some((m) => m?._id === id)) return prev;
+        return [...prev, msg];
+      });
+
+      if (msg?._id) socket.emit('message:delivered', { messageId: msg._id });
+      socket.emit('message:read', { chatId });
+      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
+    });
+
+    return () => {
+      try {
+        if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+        socket.off('connect');
+        socket.off('disconnect');
+        socket.off('connect_error');
+        socket.off('message:new');
+        socket.disconnect();
+      } catch {
+        // ignore
+      }
+      socketRef.current = null;
+    };
+  }, [apiBaseUrl, chatId, token]);
+
   const sendMessage = async () => {
     if (!chatId || typeof chatId !== 'string') return;
     const content = message.trim();
@@ -70,16 +141,23 @@ const ChatScreen = () => {
 
     try {
       setSending(true);
+      const socket = socketRef.current;
+
+      if (socket && socket.connected) {
+        setMessage('');
+        socket.emit('message:send', { chatId, content });
+        setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
+        return;
+      }
+
       const res = await authFetch(`/chats/${chatId}/messages`, {
         method: 'POST',
         body: JSON.stringify({ content }),
       });
       const created = res?.message;
-      if (created) {
-        setMessages((prev) => [...prev, created]);
-      } else {
-        await loadMessages();
-      }
+      if (created) setMessages((prev) => [...prev, created]);
+      else await loadMessages();
+
       setMessage('');
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     } catch (e) {
@@ -87,6 +165,23 @@ const ChatScreen = () => {
     } finally {
       setSending(false);
     }
+  };
+
+  const handleChangeText = (text) => {
+    setMessage(text);
+    const socket = socketRef.current;
+    if (!socket || !socket.connected || !chatId || typeof chatId !== 'string') return;
+
+    if (!typingRef.current) {
+      typingRef.current = true;
+      socket.emit('typing:start', { chatId });
+    }
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      typingRef.current = false;
+      socket.emit('typing:stop', { chatId });
+    }, 900);
   };
 
   const uiMessages = useMemo(() => {
@@ -137,10 +232,10 @@ const ChatScreen = () => {
           <Image source={community} style={styles.groupAvatar} />
           <View style={styles.textContainer}>
             <Text style={styles.groupName}>{typeof name === 'string' && name.trim() ? name : 'Chat'}</Text>
-            <View style={styles.statusRow}>
+            {/* <View style={styles.statusRow}>
               <View style={styles.onlineDot} />
               <Text style={styles.members}>122 members • 12 online</Text>
-            </View>
+            </View> */}
           </View>
         </View>
 
@@ -185,7 +280,7 @@ const ChatScreen = () => {
             placeholder="Write a message..."
             placeholderTextColor="#9CA3AF"
             value={message}
-            onChangeText={setMessage}
+            onChangeText={handleChangeText}
             multiline
           />
           
