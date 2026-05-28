@@ -27,10 +27,12 @@ const ChatScreen = () => {
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [typing, setTyping] = useState(null);
   const flatListRef = useRef(null);
   const socketRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const typingRef = useRef(false);
+  const typingClearRef = useRef(null);
 
   const router = useRouter();
   const { name, chatId, me } = useLocalSearchParams();
@@ -119,13 +121,54 @@ const ChatScreen = () => {
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
     });
 
+    socket.on('typing:start', ({ chatId: typingChatId, userId, username }) => {
+      if (!typingChatId || typingChatId !== chatId) return;
+      const myId = typeof me === 'string' ? me : null;
+      if (myId && userId && String(userId) === String(myId)) return;
+
+      setTyping(username || 'Someone');
+      if (typingClearRef.current) clearTimeout(typingClearRef.current);
+      typingClearRef.current = setTimeout(() => setTyping(null), 2500);
+    });
+
+    socket.on('typing:stop', ({ chatId: typingChatId, userId }) => {
+      if (!typingChatId || typingChatId !== chatId) return;
+      const myId = typeof me === 'string' ? me : null;
+      if (myId && userId && String(userId) === String(myId)) return;
+      setTyping(null);
+    });
+
+    socket.on('message:delivery:update', ({ messageId, deliveredTo }) => {
+      if (!messageId) return;
+      setMessages((prev) =>
+        prev.map((m) => (m?._id === messageId ? { ...m, deliveredTo: deliveredTo || [] } : m))
+      );
+    });
+
+    socket.on('message:read', ({ chatId: readChatId, userId }) => {
+      if (!readChatId || readChatId !== chatId || !userId) return;
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (!m) return m;
+          const rb = Array.isArray(m.readBy) ? m.readBy.map((x) => String(x)) : [];
+          if (rb.includes(String(userId))) return m;
+          return { ...m, readBy: [...(Array.isArray(m.readBy) ? m.readBy : []), userId] };
+        })
+      );
+    });
+
     return () => {
       try {
         if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+        if (typingClearRef.current) clearTimeout(typingClearRef.current);
         socket.off('connect');
         socket.off('disconnect');
         socket.off('connect_error');
         socket.off('message:new');
+        socket.off('typing:start');
+        socket.off('typing:stop');
+        socket.off('message:delivery:update');
+        socket.off('message:read');
         socket.disconnect();
       } catch {
         // ignore
@@ -192,6 +235,18 @@ const ChatScreen = () => {
         : '';
 
       const isMe = myId && (m?.sender?._id ? m.sender._id === myId : m?.sender === myId);
+
+      let receipt = null;
+      if (isMe) {
+        const readBy = Array.isArray(m?.readBy) ? m.readBy.map((x) => String(x)) : [];
+        const deliveredTo = Array.isArray(m?.deliveredTo) ? m.deliveredTo.map((x) => String(x)) : [];
+
+        const otherRead = readBy.some((id) => myId && id !== String(myId));
+        const otherDelivered = deliveredTo.some((id) => myId && id !== String(myId));
+
+        receipt = otherRead ? 'Read' : otherDelivered ? 'Delivered' : 'Sent';
+      }
+
       const senderName = m?.sender?.username || (isMe ? 'You' : 'User');
       const avatar = m?.sender?.photo ? { uri: m.sender.photo } : community;
 
@@ -202,6 +257,7 @@ const ChatScreen = () => {
         message: m?.content || '',
         time,
         isMe: !!isMe,
+        receipt,
       };
     });
   }, [messages, myId]);
@@ -214,7 +270,12 @@ const ChatScreen = () => {
         {!item.isMe && <Text style={styles.senderName}>{item.sender}</Text>}
         <View style={[styles.bubble, item.isMe ? styles.myBubble : styles.theirBubble]}>
           <Text style={[styles.messageText, item.isMe && styles.myMessageText]}>{item.message}</Text>
-          <Text style={[styles.timestamp, item.isMe && styles.myTimestamp]}>{item.time}</Text>
+          <View style={styles.metaRow}>
+            {!!item.receipt && item.isMe ? (
+              <Text style={[styles.receipt, item.isMe && styles.myReceipt]}>{item.receipt}</Text>
+            ) : null}
+            <Text style={[styles.timestamp, item.isMe && styles.myTimestamp]}>{item.time}</Text>
+          </View>
         </View>
       </View>
     </View>
@@ -232,6 +293,9 @@ const ChatScreen = () => {
           <Image source={community} style={styles.groupAvatar} />
           <View style={styles.textContainer}>
             <Text style={styles.groupName}>{typeof name === 'string' && name.trim() ? name : 'Chat'}</Text>
+            {typing ? (
+              <Text style={styles.typingText}>{typing} typing…</Text>
+            ) : null}
             {/* <View style={styles.statusRow}>
               <View style={styles.onlineDot} />
               <Text style={styles.members}>122 members • 12 online</Text>
@@ -318,6 +382,7 @@ const styles = StyleSheet.create({
   statusRow: { flexDirection: 'row', alignItems: 'center' },
   onlineDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#10B981', marginRight: 4 },
   members: { fontSize: 11, color: '#6B7280' },
+  typingText: { fontSize: 12, color: Colors.light.success, marginTop: 2, fontWeight: '700' },
 
   chatContent: { padding: 16, paddingBottom: 30 },
   timeHeader: { textAlign: 'center', fontSize: 11, fontWeight: '700', color: '#9CA3AF', marginBottom: 20, letterSpacing: 1 },
@@ -336,8 +401,11 @@ const styles = StyleSheet.create({
   
   messageText: { fontSize: 15, lineHeight: 20, color: '#1F2937' },
   myMessageText: { color: '#FFF' },
-  timestamp: { fontSize: 10, color: '#9CA3AF', alignSelf: 'flex-end', marginTop: 4 },
+  metaRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', marginTop: 4, gap: 8 },
+  timestamp: { fontSize: 10, color: '#9CA3AF' },
   myTimestamp: { color: 'rgba(255,255,255,0.7)' },
+  receipt: { fontSize: 10, color: '#6B7280', fontWeight: '700' },
+  myReceipt: { color: 'rgba(255,255,255,0.85)' },
 
   inputContainer: {
     flexDirection: 'row',

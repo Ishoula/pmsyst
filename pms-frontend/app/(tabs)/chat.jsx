@@ -3,13 +3,15 @@ import { View, Text, StyleSheet, Image, TouchableOpacity, FlatList, Platform, Ac
 import UserNavbar from '../../components/UserNavbar';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
-import { authFetch } from '../../context/AuthContext';
+import { authFetch, useAuth } from '../../context/AuthContext';
+import { io } from 'socket.io-client';
 
 import community from '../../assets/images/racoo.jpeg';
 import { Colors } from '../../constants/colors';
 
 const MessagesScreen = () => {
   const router = useRouter();
+  const { token, apiBaseUrl } = useAuth();
 
   const [me, setMe] = useState(null);
   const [chats, setChats] = useState([]);
@@ -39,6 +41,97 @@ const MessagesScreen = () => {
       loadChats();
     }, [loadChats])
   );
+
+  useEffect(() => {
+    if (!token) return;
+
+    const socket = io(apiBaseUrl, {
+      transports: ['websocket'],
+      auth: { token: `Bearer ${token}` },
+      autoConnect: true,
+    });
+
+    socket.on('message:new', (msg) => {
+      const chatId = msg?.chat?._id || msg?.chat;
+      if (!chatId) return;
+
+      setChats((prev) => {
+        const idx = prev.findIndex((c) => c?._id === chatId);
+        if (idx === -1) return prev;
+
+        const existing = prev[idx];
+        const myId = typeof me === 'string' ? me : (me?._id || null);
+        const senderId = msg?.sender?._id || msg?.sender;
+        const isFromMe = myId && senderId && String(senderId) === String(myId);
+
+        const nextUnread = isFromMe
+          ? (typeof existing?.unreadCount === 'number' ? existing.unreadCount : 0)
+          : (typeof existing?.unreadCount === 'number' ? existing.unreadCount + 1 : 1);
+
+        const updated = {
+          ...existing,
+          lastMessage: msg,
+          updatedAt: msg?.createdAt || new Date().toISOString(),
+          unreadCount: nextUnread,
+        };
+
+        const next = [...prev];
+        next.splice(idx, 1);
+        next.unshift(updated);
+        return next;
+      });
+    });
+
+    socket.on('message:read', ({ chatId, userId }) => {
+      const myId = typeof me === 'string' ? me : (me?._id || null);
+      if (!chatId || !myId) return;
+      if (!userId || String(userId) !== String(myId)) return;
+
+      setChats((prev) =>
+        prev.map((c) => (c?._id === chatId ? { ...c, unreadCount: 0 } : c))
+      );
+    });
+
+    socket.on('user:online', (userId) => {
+      if (!userId) return;
+      setChats((prev) =>
+        prev.map((c) => {
+          const members = Array.isArray(c?.members) ? c.members : [];
+          const nextMembers = members.map((m) =>
+            m?._id && String(m._id) === String(userId) ? { ...m, isOnline: true } : m
+          );
+          if (nextMembers === members) return c;
+          return { ...c, members: nextMembers };
+        })
+      );
+    });
+
+    socket.on('user:offline', (userId) => {
+      if (!userId) return;
+      setChats((prev) =>
+        prev.map((c) => {
+          const members = Array.isArray(c?.members) ? c.members : [];
+          const nextMembers = members.map((m) =>
+            m?._id && String(m._id) === String(userId) ? { ...m, isOnline: false } : m
+          );
+          if (nextMembers === members) return c;
+          return { ...c, members: nextMembers };
+        })
+      );
+    });
+
+    return () => {
+      try {
+        socket.off('message:new');
+        socket.off('message:read');
+        socket.off('user:online');
+        socket.off('user:offline');
+        socket.disconnect();
+      } catch {
+        // ignore
+      }
+    };
+  }, [apiBaseUrl, me, token]);
 
   const uiChats = useMemo(() => {
     const myId = typeof me === 'string' ? me : (me?._id || null);
